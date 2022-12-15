@@ -473,6 +473,14 @@ func (p Pattern) String() string {
 	return p.str
 }
 
+func (p Pattern) Regex() *regexp.Regexp {
+	return p.regex
+}
+
+func (p Pattern) Negated() bool {
+	return p.not
+}
+
 // Copied from regexp.go with * and ? removed.
 var specialBytes = []byte(`\.+()|[]{}^$`)
 
@@ -499,6 +507,7 @@ func NewPattern(s string) (*Pattern, error) {
 		return nil, errors.New("ssh_config: empty pattern")
 	}
 	negated := false
+	in := s
 	if s[0] == '!' {
 		negated = true
 		s = s[1:]
@@ -525,7 +534,7 @@ func NewPattern(s string) (*Pattern, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Pattern{str: s, regex: r, not: negated}, nil
+	return &Pattern{str: in, regex: r, not: negated}, nil
 }
 
 // Host describes a Host directive and the keywords that follow it.
@@ -663,6 +672,11 @@ func (e *Empty) String() string {
 	return fmt.Sprintf("%s#%s", strings.Repeat(" ", int(e.leadingSpace)), e.Comment)
 }
 
+type IncludedConfig struct {
+	Path   string
+	Config *Config
+}
+
 // Include holds the result of an Include directive, including the config files
 // that have been parsed as part of that directive. At most 5 levels of Include
 // statements will be parsed.
@@ -673,12 +687,8 @@ type Include struct {
 	// an include directive can include several different files, and wildcards
 	directives []string
 
-	mu sync.Mutex
-	// 1:1 mapping between matches and keys in files array; matches preserves
-	// ordering
-	matches []string
-	// actual filenames are listed here
-	files        map[string]*Config
+	mu           sync.Mutex
+	included     []*IncludedConfig
 	leadingSpace int
 	position     Position
 	depth        uint8
@@ -718,7 +728,7 @@ func NewInclude(directives []string, hasEquals bool, pos Position, comment strin
 	inc := &Include{
 		Comment:      comment,
 		directives:   directives,
-		files:        make(map[string]*Config),
+		included:     make([]*IncludedConfig, 0),
 		position:     pos,
 		leadingSpace: pos.Col - 1,
 		depth:        depth,
@@ -742,14 +752,18 @@ func NewInclude(directives []string, hasEquals bool, pos Position, comment strin
 		matches = append(matches, theseMatches...)
 	}
 	matches = removeDups(matches)
-	inc.matches = matches
+	included := []*IncludedConfig(nil)
 	for i := range matches {
 		config, err := parseWithDepth(matches[i], depth)
 		if err != nil {
 			return nil, err
 		}
-		inc.files[matches[i]] = config
+		included = append(included, &IncludedConfig{
+			Path:   matches[i],
+			Config: config,
+		})
 	}
+	inc.included = included
 	return inc, nil
 }
 
@@ -758,17 +772,20 @@ func (i *Include) Pos() Position {
 	return i.position
 }
 
+func (inc *Include) Included() []*IncludedConfig {
+	inc.mu.Lock()
+	defer inc.mu.Unlock()
+	return inc.included
+}
+
 // Get finds the first value in the Include statement matching the alias and the
 // given key.
 func (inc *Include) Get(alias, key string) string {
 	inc.mu.Lock()
 	defer inc.mu.Unlock()
 	// TODO: we search files in any order which is not correct
-	for i := range inc.matches {
-		cfg := inc.files[inc.matches[i]]
-		if cfg == nil {
-			panic("nil cfg")
-		}
+	for i := range inc.included {
+		cfg := inc.included[i].Config
 		val, err := cfg.Get(alias, key)
 		if err == nil && val != "" {
 			return val
@@ -785,11 +802,8 @@ func (inc *Include) GetAll(alias, key string) ([]string, error) {
 	var vals []string
 
 	// TODO: we search files in any order which is not correct
-	for i := range inc.matches {
-		cfg := inc.files[inc.matches[i]]
-		if cfg == nil {
-			panic("nil cfg")
-		}
+	for i := range inc.included {
+		cfg := inc.included[i].Config
 		val, err := cfg.GetAll(alias, key)
 		if err == nil && len(val) != 0 {
 			// In theory if SupportsMultiple was false for this key we could
